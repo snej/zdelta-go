@@ -1,8 +1,24 @@
+/*
+Package zdelta is a Go interface to the zdelta library (http://cis.poly.edu/zdelta/),
+which creates and applies binary deltas (aka diffs) between arbitrary strings of bytes.
+
+Delta encoding is very useful as a compact
+representation of changes in files or data records. For example, all software version
+control systems use chains of deltas to store the history of a file over time, and most
+software update systems distribute deltas (patches) instead of entire files.
+
+Zdelta is based on the Deflate algorithm, and its implementation is a modified version of
+the zlib library. Creating a delta from Source to Target is conceptually like running
+Source through deflate(), throwing away the output so far, then running Target through the
+same deflate instance.
+*/
 package zdelta
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"runtime"
 	"unsafe"
 )
 
@@ -10,130 +26,188 @@ import (
 #include "zdlib.h"
 #include "zd_mem.h"
 #include "zutil.h"
-#include <string.h>
-#include <stdlib.h>
 */
 import "C"
 
-// Expected delta compression ratio; copied from zdelta.c
-const kExpectedRatio = 4
-
-// Maximum amount of memory to use for output buffer in streamed functions
-const kDBufMaxSize = (256 * 1024)
-
-// (This is a macro in zdlib.h, so I had to translate it to a function)
-func zd_deflateInit(strm C.zd_streamp, level C.int) C.int {
-	vers := C.CString(C.ZDLIB_VERSION)
-	rval := C.zd_deflateInit_(strm, level, vers, C.int(unsafe.Sizeof(*strm)))
-	C.free(unsafe.Pointer(vers))
-	return rval
+type codec struct {
+	strm             C.zd_stream
+	strm_initialized bool
+	buf              []byte
 }
 
-// (This is a macro in zdlib.h, so I had to translate it to a function)
-func zd_inflateInit(strm C.zd_streamp) C.int {
-	vers := C.CString(C.ZDLIB_VERSION)
-	rval := C.zd_inflateInit_(strm, vers, C.int(unsafe.Sizeof(*strm)))
-	C.free(unsafe.Pointer(vers))
-	return rval
+func (c *codec) setupStrm(ref []byte, other []byte) {
+	c.strm.base[0] = arrayPtr(ref)
+	c.strm.base_avail[0] = arrayLen(ref)
+	c.strm.refnum = 1
+	c.strm.next_in = arrayPtr(other)
+	c.strm.avail_in = C.uInt(len(other))
+	c.strm.total_in = 0
+	c.strm.total_out = 0
 }
 
-func arrayPtr(a []byte) *C.Bytef {
-	return (*C.Bytef)(unsafe.Pointer(&a[0]))
-}
-func arrayLen(a []byte) C.uLong {
-	return C.uLong(len(a))
+func (c *codec) allocbuf(buf_size int) {
+	if c.buf == nil {
+		if buf_size > kDBufMaxSize {
+			buf_size = kDBufMaxSize
+		}
+		c.buf = make([]byte, buf_size)
+	}
 }
 
-func writeTo(strm *C.zd_stream, tbuf []byte, out io.Writer) error {
-	count := uintptr(unsafe.Pointer(strm.next_out)) - uintptr(unsafe.Pointer(&tbuf[0]))
+func (c *codec) resetBuf() {
+	c.strm.next_out = arrayPtr(c.buf)
+	c.strm.avail_out = C.uInt(len(c.buf))
+}
+
+func (c *codec) writeBuf(out io.Writer) error {
+	count := uintptr(unsafe.Pointer(c.strm.next_out)) - uintptr(unsafe.Pointer(&c.buf[0]))
 	if count > 0 {
-		if _, wval := out.Write(tbuf[0:count]); wval != nil {
+		if _, wval := out.Write(c.buf[0:count]); wval != nil {
 			return wval // Stream write error
 		}
 	}
 	return nil
 }
 
-type Delta []byte
-
-type ZDError C.int
-
-func (status ZDError) Error() string {
-	return fmt.Sprintf("ZDelta error %d", status)
+func (c *codec) mkError(status C.int) error {
+	err := ZDError{Status: status}
+	if c.strm.msg != nil {
+		err.Message = C.GoString(c.strm.msg)
+	} else {
+		err.Message = fmt.Sprintf("Zdelta error %d", status)
+	}
+	return &err
 }
 
-/** Returns the delta from a source to a target byte array. */
-func CreateDelta(src []byte, target []byte) (Delta, error) {
-	var rawDelta *C.Bytef
-	var deltaSize C.uLongf
-	// http://cis.poly.edu/zdelta/manual.shtml#compress1
-	status := C.zd_compress1(arrayPtr(src), arrayLen(src),
-		arrayPtr(target), arrayLen(target),
-		&rawDelta, &deltaSize)
-	if status != C.ZD_OK {
-		return nil, ZDError(status)
-	}
-	delta := make(Delta, deltaSize)
-	C.memcpy(unsafe.Pointer(&delta[0]), unsafe.Pointer(rawDelta), C.size_t(deltaSize))
-	C.free(unsafe.Pointer(rawDelta))
-	return delta, nil
+// An object that creates deltas. Can be reused, but not on multiple threads at once.
+// Reusing a Compressor is more memory-efficient than calling the CreateDelta function many
+// times in a row.
+type Compressor struct {
+	codec
 }
 
-/** Applies a precomputed delta to a source byte array, returning the target. */
-func ApplyDelta(src []byte, delta Delta) ([]byte, error) {
-	var rawTarget *C.Bytef
-	var targetSize C.uLongf
-	// http://cis.poly.edu/zdelta/manual.shtml#compress1
-	status := C.zd_uncompress1(arrayPtr(src), arrayLen(src),
-		&rawTarget, &targetSize,
-		arrayPtr(delta), arrayLen(delta))
-	if status != C.ZD_OK {
-		return nil, fmt.Errorf("ZDelta error %d", status)
-	}
-	target := make([]byte, targetSize)
-	C.memcpy(unsafe.Pointer(&target[0]), unsafe.Pointer(rawTarget), C.size_t(targetSize))
-	C.free(unsafe.Pointer(rawTarget))
-	return target, nil
+// An object that applies deltas. Can be reused, but not on multiple threads at once.
+// Reusing a Decompressor is more memory-efficient than calling the ApplyDelta function many
+// times in a row.
+type Decompressor struct {
+	codec
 }
 
-/** Given a source and a target byte array, writes the delta to the output stream. */
-func WriteDelta(ref []byte, target []byte, out io.Writer) (err error) {
-	// init io buffers:
-	var strm C.zd_stream
-	strm.base[0] = arrayPtr(ref)
-	strm.base_avail[0] = arrayLen(ref)
-	strm.refnum = 1
+// NewCompressor creates a Compressor with a specified buffer size.
+//
+// You could also just use an uninitialized Compressor struct, in which case a default
+// size buffer will be created.
+func NewCompressor(buf_size uint) Compressor {
+	var c Compressor
+	c.buf = make([]byte, buf_size)
+	return c
+}
 
-	strm.next_in = arrayPtr(target)
-	strm.avail_in = C.uInt(len(target))
+// NewCompressor creates a Decompressor with a specified buffer size.
+//
+// You could also just use an uninitialized Decompressor struct, in which case a default
+// size buffer will be created.
+func NewDecompressor(buf_size uint) Decompressor {
+	var c Decompressor
+	c.buf = make([]byte, buf_size)
+	return c
+}
 
-	// allocate the output buffer:
-	dbuf_size := (C.uLong)(len(target)/kExpectedRatio + 64)
-	if dbuf_size > kDBufMaxSize {
-		dbuf_size = kDBufMaxSize
-	}
-	dbuf := make([]byte, dbuf_size)
+// Given a source and a target byte array, writes the delta to the output stream.
+//
+// If WriteTarget or ApplyDelta is later called with the same source and delta,
+// it will output the same target.
+func (c *Compressor) WriteDelta(source []byte, target []byte, out io.Writer) (err error) {
+	c.setupStrm(source, target)
+	c.allocbuf(len(target)/kExpectedRatio + 64)
 
 	// init compresser:
-	if rval := zd_deflateInit(&strm, C.ZD_DEFAULT_COMPRESSION); rval != C.ZD_OK {
-		return ZDError(rval)
-	}
-	defer func() {
-		if rval := C.zd_deflateEnd(&strm); rval != C.ZD_OK && err == nil {
-			err = ZDError(rval)
+	var status C.int
+	if c.strm_initialized {
+		status = C.zd_deflateReset(&c.strm)
+	} else {
+		status = zd_deflateInit(&c.strm, C.ZD_DEFAULT_COMPRESSION)
+		if status == C.ZD_OK {
+			c.strm_initialized = true
+			runtime.SetFinalizer(c, func(c *Compressor) {
+				C.zd_deflateEnd(&c.strm)
+			})
 		}
-	}()
+	}
+	if status != C.ZD_OK {
+		return c.mkError(status)
+	}
+
+	for {
+		// empty the output buffer and generate output:
+		c.resetBuf()
+		status = C.zd_deflate(&c.strm, C.ZD_FINISH)
+		if status != C.ZD_OK && status != C.ZD_STREAM_END {
+			return c.mkError(status) // Compression error
+		}
+		// Write the buffer to the output stream:
+		if err = c.writeBuf(out); err != nil {
+			return err // Stream write error
+		}
+		if status == C.ZD_STREAM_END {
+			break // EOF
+		}
+	}
+	return
+}
+
+// Given a source and a target byte array, writes the delta to the output stream.
+//
+// If WriteTarget or ApplyDelta is later called with the same source and delta,
+// it will output the same target.
+func (c *Compressor) CreateDelta(src []byte, target []byte) ([]byte, error) {
+	var out bytes.Buffer
+	if err := c.WriteDelta(src, target, &out); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+// A convenience function that calls Compressor.CreateDelta with a temporary Compressor.
+//
+// (If you're creating a lot of deltas, it's more efficient to reuse one Compressor.)
+func CreateDelta(src []byte, target []byte) ([]byte, error) {
+	var c Compressor
+	return c.CreateDelta(src, target)
+}
+
+// ApplyDelta applies a precomputed delta to a source byte array, and writes the target
+// data to a Writer.
+func (d *Decompressor) WriteTarget(source []byte, delta []byte, out io.Writer) (err error) {
+	d.setupStrm(source, delta)
+	d.allocbuf(len(source) + kExpectedRatio*len(delta))
+
+	// init decompressor:
+	var status C.int
+	if d.strm_initialized {
+		status = C.zd_inflateReset(&d.strm)
+	} else {
+		status = zd_inflateInit(&d.strm)
+		if status == C.ZD_OK {
+			d.strm_initialized = true
+			runtime.SetFinalizer(d, func(d *Decompressor) {
+				C.zd_inflateEnd(&d.strm)
+			})
+		}
+	}
+	if status != C.ZD_OK {
+		return d.mkError(status)
+	}
 
 	for {
 		// reset the output buffer and generate output:
-		strm.next_out = arrayPtr(dbuf)
-		strm.avail_out = C.uInt(dbuf_size)
-		rval := C.zd_deflate(&strm, C.ZD_FINISH)
+		d.resetBuf()
+		rval := C.zd_inflate(&d.strm, C.ZD_SYNC_FLUSH)
 		if rval != C.ZD_OK && rval != C.ZD_STREAM_END {
-			return ZDError(rval) // Compression error
+			return d.mkError(rval) // Decompression error
 		}
 		// Write to the output stream:
-		if err = writeTo(&strm, dbuf, out); err != nil {
+		if err = writeTo(&d.strm, d.buf, out); err != nil {
 			return err // Stream write error
 		}
 		if rval == C.ZD_STREAM_END {
@@ -143,50 +217,20 @@ func WriteDelta(ref []byte, target []byte, out io.Writer) (err error) {
 	return
 }
 
-/** Given a source and a delta, computes the target and writes it to the output stream. */
-func WriteDeltaTarget(ref []byte, delta Delta, out io.Writer) (err error) {
-	// init io buffers:
-	var strm C.zd_stream
-	strm.base[0] = arrayPtr(ref)
-	strm.base_avail[0] = arrayLen(ref)
-	strm.refnum = 1
-	strm.avail_in = C.uInt(len(delta))
-	strm.next_in = arrayPtr(delta)
-
-	// allocate target buffer:
-	tbuf_size := C.uInt(len(ref) + kExpectedRatio*len(delta))
-	if tbuf_size > kDBufMaxSize {
-		tbuf_size = kDBufMaxSize
+// ApplyDelta applies a precomputed delta to a source byte array, returning the target.
+func (d *Decompressor) ApplyDelta(src []byte, delta []byte) ([]byte, error) {
+	var out bytes.Buffer
+	if err := d.WriteTarget(src, delta, &out); err != nil {
+		return nil, err
 	}
-	tbuf := make([]byte, tbuf_size)
-	strm.avail_out = tbuf_size
-	strm.next_out = arrayPtr(tbuf)
+	return out.Bytes(), nil
+}
 
-	// init decompressor:
-	if rval := zd_inflateInit(&strm); rval != C.ZD_OK {
-		return ZDError(rval)
-	}
-	defer func() {
-		if rval := C.zd_inflateEnd(&strm); rval != C.ZD_OK && err == nil {
-			err = ZDError(rval)
-		}
-	}()
-
-	for {
-		// reset the output buffer and generate output:
-		strm.next_out = arrayPtr(tbuf)
-		strm.avail_out = tbuf_size
-		rval := C.zd_inflate(&strm, C.ZD_SYNC_FLUSH)
-		if rval != C.ZD_OK && rval != C.ZD_STREAM_END {
-			return ZDError(rval) // Decompression error
-		}
-		// Write to the output stream:
-		if err = writeTo(&strm, tbuf, out); err != nil {
-			return err // Stream write error
-		}
-		if rval == C.ZD_STREAM_END {
-			break // EOF
-		}
-	}
-	return
+// ApplyDelta is a convenience function that calls Decompressor.ApplyDelta with a temporary
+// Decompressor.
+//
+// (If you're applying a lot of deltas, it's more efficient to reuse one Decompressor.)
+func ApplyDelta(src []byte, delta []byte) ([]byte, error) {
+	var d Decompressor
+	return d.ApplyDelta(src, delta)
 }
