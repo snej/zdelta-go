@@ -156,7 +156,7 @@ func (c *Compressor) WriteDelta(source []byte, target []byte, out io.Writer) (er
 	return
 }
 
-// Given a source and a target byte array, writes the delta to the output stream.
+// Given a source and a target byte array, returns the delta.
 //
 // If WriteTarget or ApplyDelta is later called with the same source and delta,
 // it will output the same target.

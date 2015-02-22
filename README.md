@@ -16,7 +16,7 @@ import "github.com/snej/zdelta-go"
 
 The zdelta source code (in C) is contained in this package, so it's standalone and you don't need to install any shared libraries into your system.  (There's no official up-to-date zdelta source repository, so I copied the source from my [unofficial](https://github.com/snej/zdelta) (but up-to-date, as far as I know) one.)
 
-Basic usage is simple. Let's say you have two byte arrays, `vers1` and `vers2`, containing two versions of a file. You want to send the second version to someone who only has the first. So you generate a delta:
+[Here's the Godoc documentation](https://godoc.org/github.com/snej/zdelta-go). And here's an example of basic usage: Let's say you have two byte arrays, `vers1` and `vers2`, containing two revisions of a file. You want to send the second version to someone who only has the first. So you generate a delta:
 
 ```go
 delta, err := zdelta.CreateDelta(vers1, vers2)
