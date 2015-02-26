@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"sync"
 	"unsafe"
 )
 
@@ -92,6 +93,8 @@ type Compressor struct {
 type Decompressor struct {
 	codec
 }
+
+//////// COMPRESSOR:
 
 // NewCompressor creates a Compressor with a specified buffer size.
 //
@@ -168,13 +171,7 @@ func (c *Compressor) CreateDelta(src []byte, target []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// A convenience function that calls Compressor.CreateDelta with a temporary Compressor.
-//
-// (If you're creating a lot of deltas, it's more efficient to reuse one Compressor.)
-func CreateDelta(src []byte, target []byte) ([]byte, error) {
-	var c Compressor
-	return c.CreateDelta(src, target)
-}
+//////// DECOMPRESSOR:
 
 // ApplyDelta applies a precomputed delta to a source byte array, and writes the target
 // data to a Writer.
@@ -226,11 +223,35 @@ func (d *Decompressor) ApplyDelta(src []byte, delta []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+//////// CONVENIENCES:
+
+var sCompressorPool, sDecompressorPool sync.Pool
+
+func init() {
+	sCompressorPool.New = func() interface{} {
+		c := NewCompressor(kDBufMaxSize)
+		return &c
+	}
+	sDecompressorPool.New = func() interface{} {
+		d := NewDecompressor(kDBufMaxSize)
+		return &d
+	}
+}
+
+// CreateDelta is a convenience function that calls Compressor.CreateDelta with a temporary
+// Compressor.
+func CreateDelta(src []byte, target []byte) ([]byte, error) {
+	c := sCompressorPool.Get().(*Compressor)
+	result, err := c.CreateDelta(src, target)
+	sCompressorPool.Put(c)
+	return result, err
+}
+
 // ApplyDelta is a convenience function that calls Decompressor.ApplyDelta with a temporary
 // Decompressor.
-//
-// (If you're applying a lot of deltas, it's more efficient to reuse one Decompressor.)
 func ApplyDelta(src []byte, delta []byte) ([]byte, error) {
-	var d Decompressor
-	return d.ApplyDelta(src, delta)
+	d := sDecompressorPool.Get().(*Decompressor)
+	result, err := d.ApplyDelta(src, delta)
+	sDecompressorPool.Put(d)
+	return result, err
 }
