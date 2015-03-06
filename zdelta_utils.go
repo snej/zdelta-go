@@ -16,7 +16,7 @@ import "C"
 const kExpectedRatio = 4
 
 // Maximum amount of memory to use for output buffer in streamed functions
-const kDBufMaxSize = (256 * 1024)
+const kDBufMaxSize = (16 * 1024)
 
 // (This is a macro in zdlib.h, so I had to translate it to a function)
 func zd_deflateInit(strm C.zd_streamp, level C.int) C.int {

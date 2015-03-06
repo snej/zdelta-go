@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"runtime"
 	"sync"
 	"unsafe"
 )
@@ -31,14 +30,14 @@ import (
 import "C"
 
 type codec struct {
-	strm             C.zd_stream
-	strm_initialized bool
-	buf              []byte
+	strm C.zd_stream
+	buf  []byte
 }
 
 func (c *codec) setupStrm(ref []byte, other []byte) {
 	c.strm.base[0] = arrayPtr(ref)
 	c.strm.base_avail[0] = arrayLen(ref)
+	c.strm.base_out[0] = 0
 	c.strm.refnum = 1
 	c.strm.next_in = arrayPtr(other)
 	c.strm.avail_in = C.uInt(len(other))
@@ -125,26 +124,15 @@ func (c *Compressor) WriteDelta(source []byte, target []byte, out io.Writer) (er
 	c.allocbuf(len(target)/kExpectedRatio + 64)
 
 	// init compresser:
-	var status C.int
-	if c.strm_initialized {
-		status = C.zd_deflateReset(&c.strm)
-	} else {
-		status = zd_deflateInit(&c.strm, C.ZD_DEFAULT_COMPRESSION)
-		if status == C.ZD_OK {
-			c.strm_initialized = true
-			runtime.SetFinalizer(c, func(c *Compressor) {
-				C.zd_deflateEnd(&c.strm)
-			})
-		}
-	}
-	if status != C.ZD_OK {
+	if status := zd_deflateInit(&c.strm, C.ZD_DEFAULT_COMPRESSION); status != C.ZD_OK {
 		return c.mkError(status)
 	}
+	defer func() { C.zd_deflateEnd(&c.strm) }()
 
 	for {
 		// empty the output buffer and generate output:
 		c.resetBuf()
-		status = C.zd_deflate(&c.strm, C.ZD_FINISH)
+		status := C.zd_deflate(&c.strm, C.ZD_FINISH)
 		if status != C.ZD_OK && status != C.ZD_STREAM_END {
 			return c.mkError(status) // Compression error
 		}
@@ -180,21 +168,10 @@ func (d *Decompressor) WriteTarget(source []byte, delta []byte, out io.Writer) (
 	d.allocbuf(len(source) + kExpectedRatio*len(delta))
 
 	// init decompressor:
-	var status C.int
-	if d.strm_initialized {
-		status = C.zd_inflateReset(&d.strm)
-	} else {
-		status = zd_inflateInit(&d.strm)
-		if status == C.ZD_OK {
-			d.strm_initialized = true
-			runtime.SetFinalizer(d, func(d *Decompressor) {
-				C.zd_inflateEnd(&d.strm)
-			})
-		}
-	}
-	if status != C.ZD_OK {
+	if status := zd_inflateInit(&d.strm); status != C.ZD_OK {
 		return d.mkError(status)
 	}
+	defer func() { C.zd_inflateEnd(&d.strm) }()
 
 	for {
 		// reset the output buffer and generate output:

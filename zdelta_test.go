@@ -27,3 +27,25 @@ func TestCreateDelta(t *testing.T) {
 		t.Fatalf("Reconstituted target is wrong")
 	}
 }
+
+func TestReuseCompressor(t *testing.T) {
+	src := []byte("In Xanadu did Kublai Khan a stately pleasure-dome decree")
+	target := []byte("In Ooo did Jake a bitchen pleasure-dome decree")
+
+	var c Compressor
+	delta1, err := c.CreateDelta(src, target)
+	if err != nil {
+		t.Fatalf("CreateDelta returned %v", err)
+	}
+	log.Printf("Delta = %x", delta1)
+
+	delta2, err := c.CreateDelta(src, target)
+	if err != nil {
+		t.Fatalf("CreateDelta returned %v", err)
+	}
+	log.Printf("Delta = %x", delta2)
+
+	if !reflect.DeepEqual(delta1, delta2) {
+		t.Fatalf("Incorrect delta after reset!")
+	}
+}
